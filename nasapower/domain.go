@@ -2,8 +2,7 @@ package nasapower
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
@@ -16,60 +15,64 @@ import (
 //
 // exactly as a database/sql program enables a driver with `import _
 // "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// nasapower:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone nasapower binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// nasapower:// URIs by routing to the operations Register installs.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the nasapower driver. It carries no state; the per-run client is
+// Domain is the NASA POWER driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames a pasted link is matched against, and
+// the identity used for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "nasapower",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "nasapower",
-			Short:  "A command line for nasapower.",
-			Long: `A command line for nasapower.
+			Short:  "A command line for the NASA POWER climate data API.",
+			Long: `A command line for the NASA POWER (Prediction Of Worldwide Energy Resources) API.
 
-nasapower reads public nasapower data over plain HTTPS, shapes it into
+nasapower reads public climate data from power.larc.nasa.gov, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+key, nothing to run alongside it.
+
+Available parameter codes include:
+  T2M            Air temperature at 2m (°C)
+  PRECTOTCORR    Precipitation corrected (mm/day)
+  ALLSKY_SFC_SW_DWN  All sky solar radiation (kWh/m²/day)
+  WS2M           Wind speed at 2m (m/s)
+  RH2M           Relative humidity at 2m (%)
+
+Communities: RE (Renewable Energy), SB (Sustainable Buildings), AG (Agroclimatology)`,
+			Site: "https://power.larc.nasa.gov",
 			Repo: "https://github.com/tamnd/nasapower-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `nasapower page` and
-	// `ant get nasapower://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "daily",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch daily climate observations for a location",
+		URIType: "point",
+	}, getDaily)
 
-	// List op: members of a page, the home of `nasapower links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// nasapower://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "monthly",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch monthly climate observations for a location",
+		URIType: "point",
+	}, getMonthly)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,40 +91,49 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type dailyInput struct {
+	Lat        float64 `kit:"flag" help:"latitude (-90 to 90)" default:"40.71"`
+	Lon        float64 `kit:"flag" help:"longitude (-180 to 180)" default:"-74.01"`
+	Start      string  `kit:"flag" help:"start date YYYYMMDD" default:"20230101"`
+	End        string  `kit:"flag" help:"end date YYYYMMDD" default:"20231231"`
+	Parameters string  `kit:"flag" help:"comma-separated parameter codes" default:"T2M,PRECTOTCORR,WS2M"`
+	Community  string  `kit:"flag" help:"community: RE|SB|AG" default:"SB"`
+	Client     *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type monthlyInput struct {
+	Lat        float64 `kit:"flag" help:"latitude (-90 to 90)" default:"40.71"`
+	Lon        float64 `kit:"flag" help:"longitude (-180 to 180)" default:"-74.01"`
+	Start      string  `kit:"flag" help:"start year YYYY" default:"2020"`
+	End        string  `kit:"flag" help:"end year YYYY" default:"2023"`
+	Parameters string  `kit:"flag" help:"comma-separated parameter codes" default:"ALLSKY_SFC_SW_DWN,T2M,WS2M"`
+	Community  string  `kit:"flag" help:"community: RE|SB|AG" default:"RE"`
+	Client     *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getDaily(ctx context.Context, in dailyInput, emit func(*Observation) error) error {
+	obs, err := in.Client.Daily(ctx, in.Lat, in.Lon, in.Start, in.End, in.Parameters, in.Community)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	for i := range obs {
+		if err := emit(&obs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func getMonthly(ctx context.Context, in monthlyInput, emit func(*Observation) error) error {
+	obs, err := in.Client.Monthly(ctx, in.Lat, in.Lon, in.Start, in.End, in.Parameters, in.Community)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range obs {
+		if err := emit(&obs[i]); err != nil {
 			return err
 		}
 	}
@@ -130,44 +142,51 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full nasapower.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id).
+// A coordinate pair "lat,lon" classifies as a "point"; a date string
+// (YYYYMMDD or YYYYMM) classifies as a "date".
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized nasapower reference: %q", input)
+	// Try coordinate pair "lat,lon"
+	var lat, lon float64
+	if n, _ := fmt.Sscanf(input, "%f,%f", &lat, &lon); n == 2 {
+		return "point", input, nil
 	}
-	return "page", id, nil
+	// Try date string: YYYYMMDD (8 digits) or YYYYMM (6 digits) or YYYY (4 digits)
+	if isDateLike(input) {
+		return "date", input, nil
+	}
+	return "", "", errs.Usage("unrecognized nasapower reference: %q (want lat,lon or YYYYMMDD date)", input)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the live URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "point":
+		return "https://power.larc.nasa.gov/data-access-viewer/", nil
+	case "date":
+		return "https://power.larc.nasa.gov/data-access-viewer/", nil
+	default:
 		return "", errs.Usage("nasapower has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// isDateLike returns true if the string looks like a YYYY, YYYYMM, or YYYYMMDD date.
+func isDateLike(s string) bool {
+	if len(s) != 4 && len(s) != 6 && len(s) != 8 {
+		return false
 	}
-	return strings.Trim(input, "/")
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
